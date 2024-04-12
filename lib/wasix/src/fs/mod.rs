@@ -605,6 +605,7 @@ impl WasiFs {
 
             let current_dir = self.current_dir.lock().unwrap();
             path = format!("{}/{}", current_dir.as_str(), &path);
+            eprintln!("whoa {} {}", current_dir.as_str(), path);
             if path.contains("//") {
                 path = path.replace("//", "/");
             }
@@ -1769,6 +1770,16 @@ impl WasiFs {
                 .root_fs
                 .metadata(path)
                 .map_err(|e| format!("Could not get metadata for file {:?}: {}", path, e))?;
+
+            if let Some(alias) = alias {
+                // User has mounted some host directory to `.` in guest. By default, `current_dir` was
+                // set to `/`. But the user's intention is clear here: the host directory *is* the current
+                // directory. For this reason, we set `current_dir` to the mount point of the host directory.
+
+                if alias == "." {
+                    *self.current_dir.lock().unwrap() = "/mnt/host".to_string();
+                }
+            }
 
             let kind = if cur_dir_metadata.is_dir() {
                 Kind::Dir {

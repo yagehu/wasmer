@@ -605,7 +605,6 @@ impl WasiFs {
 
             let current_dir = self.current_dir.lock().unwrap();
             path = format!("{}/{}", current_dir.as_str(), &path);
-            eprintln!("whoa {} {}", current_dir.as_str(), path);
             if path.contains("//") {
                 path = path.replace("//", "/");
             }

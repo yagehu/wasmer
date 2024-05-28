@@ -74,6 +74,36 @@ mod queries {
         pub download_url: Option<String>,
         pub size: Option<i32>,
         pub pirita_size: Option<i32>,
+        pub webc_version: Option<WebcVersion>,
+    }
+
+    #[derive(cynic::Enum, Clone, Copy, Debug)]
+    pub enum WebcVersion {
+        V2,
+        V3,
+    }
+
+    #[derive(cynic::QueryFragment, Debug, Clone, Serialize)]
+    pub struct WebcImage {
+        pub created_at: DateTime,
+        pub updated_at: DateTime,
+        pub webc_url: String,
+        pub webc_sha256: String,
+        pub file_size: BigInt,
+        pub manifest: JSONString,
+        pub version: Option<WebcVersion>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug, Clone, Serialize)]
+    pub struct PackageWebc {
+        pub id: cynic::Id,
+        pub created_at: DateTime,
+        pub updated_at: DateTime,
+        pub tag: String,
+        pub is_archived: bool,
+        pub webc_url: String,
+        pub webc: Option<WebcImage>,
+        pub webc_v3: Option<WebcImage>,
     }
 
     #[derive(cynic::QueryFragment, Debug, Clone, Serialize)]
@@ -91,9 +121,85 @@ mod queries {
         pub version: String,
         pub created_at: DateTime,
         pub pirita_manifest: Option<JSONString>,
-        pub distribution: PackageDistribution,
-
         pub package: Package,
+
+        #[arguments(version: "V3")]
+        #[cynic(rename = "distribution")]
+        pub distribution_v3: PackageDistribution,
+
+        #[arguments(version: "V2")]
+        #[cynic(rename = "distribution")]
+        pub distribution_v2: PackageDistribution,
+    }
+
+    #[derive(cynic::QueryVariables, Debug)]
+    pub struct GetAppTemplateFromSlugVariables {
+        pub slug: String,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    #[cynic(graphql_type = "Query", variables = "GetAppTemplateFromSlugVariables")]
+    pub struct GetAppTemplateFromSlug {
+        #[arguments(slug: $slug)]
+        pub get_app_template: Option<AppTemplate>,
+    }
+    #[derive(cynic::QueryVariables, Debug)]
+    pub struct GetAppTemplatesQueryVariables {
+        pub category_slug: String,
+        pub first: i32,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    #[cynic(graphql_type = "Query", variables = "GetAppTemplatesQueryVariables")]
+    pub struct GetAppTemplatesQuery {
+        #[arguments(categorySlug: $category_slug, first: $first)]
+        pub get_app_templates: Option<AppTemplateConnection>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct AppTemplateConnection {
+        pub edges: Vec<Option<AppTemplateEdge>>,
+        pub page_info: PageInfo,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct AppTemplateEdge {
+        pub node: Option<AppTemplate>,
+        pub cursor: String,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct AppTemplate {
+        pub demo_url: String,
+        pub language: String,
+        pub name: String,
+        pub framework: String,
+        pub created_at: DateTime,
+        pub description: String,
+        pub id: cynic::Id,
+        pub is_public: bool,
+        pub repo_license: String,
+        pub readme: String,
+        pub repo_url: String,
+        pub slug: String,
+        pub updated_at: DateTime,
+        pub use_cases: Jsonstring,
+    }
+
+    #[derive(cynic::Scalar, Debug, Clone)]
+    #[cynic(graphql_type = "JSONString")]
+    pub struct Jsonstring(pub String);
+
+    #[derive(cynic::QueryVariables, Debug)]
+    pub struct GetPackageReleaseVars {
+        pub hash: String,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    #[cynic(graphql_type = "Query", variables = "GetPackageReleaseVars")]
+    pub struct GetPackageRelease {
+        #[arguments(hash: $hash)]
+        pub get_package_release: Option<PackageWebc>,
     }
 
     #[derive(cynic::QueryVariables, Debug)]
@@ -127,6 +233,62 @@ mod queries {
         Oldest,
     }
 
+    #[derive(cynic::QueryVariables, Debug)]
+    pub struct PushPackageReleaseVariables<'a> {
+        pub name: Option<&'a str>,
+        pub namespace: &'a str,
+        pub private: Option<bool>,
+        pub signed_url: &'a str,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    #[cynic(graphql_type = "Mutation", variables = "PushPackageReleaseVariables")]
+    pub struct PushPackageRelease {
+        #[arguments(input: { name: $name, namespace: $namespace, private: $private, signedUrl: $signed_url })]
+        pub push_package_release: Option<PushPackageReleasePayload>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct PushPackageReleasePayload {
+        pub package_webc: Option<PackageWebc>,
+        pub success: bool,
+    }
+
+    #[derive(cynic::QueryVariables, Debug)]
+    pub struct TagPackageReleaseVariables<'a> {
+        pub description: Option<&'a str>,
+        pub homepage: Option<&'a str>,
+        pub license: Option<&'a str>,
+        pub license_file: Option<&'a str>,
+        pub manifest: &'a str,
+        pub name: &'a str,
+        pub namespace: Option<&'a str>,
+        pub package_release_id: &'a cynic::Id,
+        pub private: Option<bool>,
+        pub readme: Option<&'a str>,
+        pub repository: Option<&'a str>,
+        pub version: &'a str,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    #[cynic(graphql_type = "Mutation", variables = "TagPackageReleaseVariables")]
+    pub struct TagPackageRelease {
+        #[arguments(input: { description: $description, homepage: $homepage, license: $license, licenseFile: $license_file, manifest: $manifest, name: $name, namespace: $namespace, packageReleaseId: $package_release_id, private: $private, readme: $readme, repository: $repository, version: $version })]
+        pub tag_package_release: Option<TagPackageReleasePayload>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct TagPackageReleasePayload {
+        pub success: bool,
+        pub package_version: Option<PackageVersion>,
+    }
+
+    #[derive(cynic::InputObject, Debug)]
+    pub struct InputSignature<'a> {
+        pub public_key_key_id: &'a str,
+        pub data: &'a str,
+    }
+
     #[derive(cynic::QueryVariables, Debug, Clone, Default)]
     pub struct AllPackageVersionsVars {
         pub offset: Option<i32>,
@@ -154,6 +316,80 @@ mod queries {
             sortBy: $sort_by,
         )]
         pub all_package_versions: PackageVersionConnection,
+    }
+
+    #[derive(cynic::QueryVariables, Debug, Clone, Default)]
+    pub struct AllPackageReleasesVars {
+        pub offset: Option<i32>,
+        pub before: Option<String>,
+        pub after: Option<String>,
+        pub first: Option<i32>,
+        pub last: Option<i32>,
+
+        pub created_after: Option<DateTime>,
+        pub updated_after: Option<DateTime>,
+        pub sort_by: Option<PackageVersionSortBy>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    #[cynic(graphql_type = "Query", variables = "AllPackageReleasesVars")]
+    pub struct GetAllPackageReleases {
+        #[arguments(
+            first: $first,
+            last: $last,
+            after: $after,
+            before: $before,
+            offset: $offset,
+            updatedAfter: $updated_after,
+            createdAfter: $created_after,
+            sortBy: $sort_by,
+        )]
+        pub all_package_releases: PackageWebcConnection,
+    }
+
+    impl GetAllPackageReleases {
+        pub fn into_packages(self) -> Vec<PackageWebc> {
+            self.all_package_releases
+                .edges
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.node)
+                .collect()
+        }
+    }
+
+    #[derive(cynic::QueryVariables, Debug)]
+    pub struct GetSignedUrlForPackageUploadVariables<'a> {
+        pub expires_after_seconds: Option<i32>,
+        pub filename: Option<&'a str>,
+        pub name: Option<&'a str>,
+        pub version: Option<&'a str>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    #[cynic(
+        graphql_type = "Query",
+        variables = "GetSignedUrlForPackageUploadVariables"
+    )]
+    pub struct GetSignedUrlForPackageUpload {
+        #[arguments(name: $name, version: $version, filename: $filename, expiresAfterSeconds: $expires_after_seconds)]
+        pub get_signed_url_for_package_upload: Option<SignedUrl>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct SignedUrl {
+        pub url: String,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct PackageWebcConnection {
+        pub page_info: PageInfo,
+        pub edges: Vec<Option<PackageWebcEdge>>,
+    }
+
+    #[derive(cynic::QueryFragment, Debug)]
+    pub struct PackageWebcEdge {
+        pub node: Option<PackageWebc>,
     }
 
     #[derive(cynic::QueryFragment, Debug)]
@@ -422,6 +658,7 @@ mod queries {
         pub admin_url: String,
         pub owner: Owner,
         pub url: String,
+        pub permalink: String,
         pub deleted: bool,
         pub aliases: AppAliasConnection,
     }
@@ -645,7 +882,7 @@ mod queries {
         pub token: String,
     }
 
-    #[derive(cynic::Enum, Clone, Copy, Debug)]
+    #[derive(cynic::Enum, Clone, Copy, Debug, PartialEq)]
     pub enum LogStream {
         Stdout,
         Stderr,
@@ -699,6 +936,7 @@ mod queries {
         pub message: String,
         /// When the message was recorded, in nanoseconds since the Unix epoch.
         pub timestamp: f64,
+        pub stream: Option<LogStream>,
     }
 
     #[derive(cynic::QueryVariables, Debug)]

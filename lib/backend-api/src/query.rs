@@ -2,18 +2,21 @@ use std::{collections::HashSet, pin::Pin, time::Duration};
 
 use anyhow::{bail, Context};
 use cynic::{MutationBuilder, QueryBuilder};
-use edge_schema::schema::{NetworkTokenV1, WebcIdent};
+use edge_schema::schema::NetworkTokenV1;
 use futures::{Stream, StreamExt};
 use time::OffsetDateTime;
 use tracing::Instrument;
 use url::Url;
+use wasmer_config::package::PackageIdent;
 
 use crate::{
     types::{
         self, CreateNamespaceVars, DeployApp, DeployAppConnection, DeployAppVersion,
-        DeployAppVersionConnection, DnsDomain, GetCurrentUserWithAppsVars, GetDeployAppAndVersion,
-        GetDeployAppVersionsVars, GetNamespaceAppsVars, Log, LogStream, PackageVersionConnection,
-        PublishDeployAppVars, UpsertDomainFromZoneFileVars,
+        DeployAppVersionConnection, DnsDomain, GetAppTemplateFromSlugVariables,
+        GetAppTemplatesQueryVariables, GetCurrentUserWithAppsVars, GetDeployAppAndVersion,
+        GetDeployAppVersionsVars, GetNamespaceAppsVars, GetSignedUrlForPackageUploadVariables, Log,
+        LogStream, PackageVersionConnection, PublishDeployAppVars, PushPackageReleasePayload,
+        SignedUrl, TagPackageReleasePayload, UpsertDomainFromZoneFileVars,
     },
     GraphQLApiFailure, WasmerClient,
 };
@@ -24,10 +27,21 @@ use crate::{
 /// the API, and should not be used where possible.
 pub async fn fetch_webc_package(
     client: &WasmerClient,
-    ident: &WebcIdent,
+    ident: &PackageIdent,
     default_registry: &Url,
 ) -> Result<webc::compat::Container, anyhow::Error> {
-    let url = ident.build_download_url_with_default_registry(default_registry);
+    let url = match ident {
+        PackageIdent::Named(n) => Url::parse(&format!(
+            "{default_registry}/{}:{}",
+            n.full_name(),
+            n.version_or_default()
+        ))?,
+        PackageIdent::Hash(h) => match get_package_release(client, &h.to_string()).await? {
+            Some(webc) => Url::parse(&webc.webc_url)?,
+            None => anyhow::bail!("Could not find package with hash '{}'", h),
+        },
+    };
+
     let data = client
         .client
         .get(url)
@@ -40,6 +54,114 @@ pub async fn fetch_webc_package(
         .await?;
 
     webc::compat::Container::from_bytes(data).context("failed to parse webc package")
+}
+
+/// Fetch app templates.
+pub async fn fetch_app_template_from_slug(
+    client: &WasmerClient,
+    slug: String,
+) -> Result<Option<types::AppTemplate>, anyhow::Error> {
+    client
+        .run_graphql_strict(types::GetAppTemplateFromSlug::build(
+            GetAppTemplateFromSlugVariables { slug },
+        ))
+        .await
+        .map(|v| v.get_app_template)
+}
+
+/// Fetch app templates.
+pub async fn fetch_app_templates(
+    client: &WasmerClient,
+    category_slug: String,
+    first: i32,
+) -> Result<Option<types::AppTemplateConnection>, anyhow::Error> {
+    client
+        .run_graphql_strict(types::GetAppTemplatesQuery::build(
+            GetAppTemplatesQueryVariables {
+                category_slug,
+                first,
+            },
+        ))
+        .await
+        .map(|r| r.get_app_templates)
+}
+
+/// Get a signed URL to upload packages.
+pub async fn get_signed_url_for_package_upload(
+    client: &WasmerClient,
+    expires_after_seconds: Option<i32>,
+    filename: Option<&str>,
+    name: Option<&str>,
+    version: Option<&str>,
+) -> Result<Option<SignedUrl>, anyhow::Error> {
+    client
+        .run_graphql(types::GetSignedUrlForPackageUpload::build(
+            GetSignedUrlForPackageUploadVariables {
+                expires_after_seconds,
+                filename,
+                name,
+                version,
+            },
+        ))
+        .await
+        .map(|r| r.get_signed_url_for_package_upload)
+}
+/// Push a package to the registry.
+pub async fn push_package_release(
+    client: &WasmerClient,
+    name: Option<&str>,
+    namespace: &str,
+    signed_url: &str,
+    private: Option<bool>,
+) -> Result<Option<PushPackageReleasePayload>, anyhow::Error> {
+    client
+        .run_graphql_strict(types::PushPackageRelease::build(
+            types::PushPackageReleaseVariables {
+                name,
+                namespace,
+                private,
+                signed_url,
+            },
+        ))
+        .await
+        .map(|r| r.push_package_release)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn tag_package_release(
+    client: &WasmerClient,
+    description: Option<&str>,
+    homepage: Option<&str>,
+    license: Option<&str>,
+    license_file: Option<&str>,
+    manifest: &str,
+    name: &str,
+    namespace: Option<&str>,
+    package_release_id: &cynic::Id,
+    private: Option<bool>,
+    readme: Option<&str>,
+    repository: Option<&str>,
+    version: &str,
+) -> Result<Option<TagPackageReleasePayload>, anyhow::Error> {
+    client
+        .run_graphql_strict(types::TagPackageRelease::build(
+            types::TagPackageReleaseVariables {
+                description,
+                homepage,
+                license,
+                license_file,
+                manifest,
+                name,
+                namespace,
+                package_release_id,
+                private,
+                readme,
+                repository,
+                version,
+            },
+        ))
+        .await
+        .map(|r| r.tag_package_release)
 }
 
 /// Get the currently logged in used, together with all accessible namespaces.
@@ -612,6 +734,32 @@ pub async fn get_package_versions(
     Ok(res.all_package_versions)
 }
 
+/// Retrieve a package release by hash.
+pub async fn get_package_release(
+    client: &WasmerClient,
+    hash: &str,
+) -> Result<Option<types::PackageWebc>, anyhow::Error> {
+    let hash = hash.trim_start_matches("sha256:");
+    client
+        .run_graphql_strict(types::GetPackageRelease::build(
+            types::GetPackageReleaseVars {
+                hash: hash.to_string(),
+            },
+        ))
+        .await
+        .map(|x| x.get_package_release)
+}
+
+pub async fn get_package_releases(
+    client: &WasmerClient,
+    vars: types::AllPackageReleasesVars,
+) -> Result<types::PackageWebcConnection, anyhow::Error> {
+    let res = client
+        .run_graphql(types::GetAllPackageReleases::build(vars))
+        .await?;
+    Ok(res.all_package_releases)
+}
+
 /// Retrieve all versions of a package as a stream that auto-paginates.
 pub fn get_package_versions_stream(
     client: &WasmerClient,
@@ -637,6 +785,39 @@ pub fn get_package_versions_stream(
                 .collect::<Vec<_>>();
 
             let new_vars = end_cursor.map(|cursor| types::AllPackageVersionsVars {
+                after: Some(cursor),
+                ..vars
+            });
+
+            Ok(Some((items, new_vars)))
+        },
+    )
+}
+
+/// Retrieve all package releases as a stream.
+pub fn get_package_releases_stream(
+    client: &WasmerClient,
+    vars: types::AllPackageReleasesVars,
+) -> impl futures::Stream<Item = Result<Vec<types::PackageWebc>, anyhow::Error>> + '_ {
+    futures::stream::try_unfold(
+        Some(vars),
+        move |vars: Option<types::AllPackageReleasesVars>| async move {
+            let vars = match vars {
+                Some(vars) => vars,
+                None => return Ok(None),
+            };
+
+            let page = get_package_releases(client, vars.clone()).await?;
+
+            let end_cursor = page.page_info.end_cursor;
+
+            let items = page
+                .edges
+                .into_iter()
+                .filter_map(|x| x.and_then(|x| x.node))
+                .collect::<Vec<_>>();
+
+            let new_vars = end_cursor.map(|cursor| types::AllPackageReleasesVars {
                 after: Some(cursor),
                 ..vars
             });
@@ -734,7 +915,7 @@ fn get_app_logs(
                     .run_graphql(types::GetDeployAppLogs::build(variables.clone()))
                     .await?
                     .get_deploy_app_version
-                    .context("unknown package version")?;
+                    .context("app version not found")?;
 
                 let page: Vec<_> = deploy_app_version
                     .logs

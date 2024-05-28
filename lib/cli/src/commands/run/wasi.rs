@@ -13,7 +13,9 @@ use tokio::runtime::Handle;
 use url::Url;
 use virtual_fs::{DeviceFile, FileSystem, PassthruFileSystem, RootFileSystemBuilder};
 use wasmer::{Engine, Function, Instance, Memory32, Memory64, Module, RuntimeError, Store, Value};
+use wasmer_config::package::PackageSource as PackageSpecifier;
 use wasmer_registry::wasmer_env::WasmerEnv;
+use wasmer_types::ModuleHash;
 #[cfg(feature = "journal")]
 use wasmer_wasix::journal::{LogFileJournal, SnapshotTrigger};
 use wasmer_wasix::{
@@ -26,12 +28,9 @@ use wasmer_wasix::{
     rewind_ext,
     runners::{MappedCommand, MappedDirectory},
     runtime::{
-        module_cache::{FileSystemCache, ModuleCache, ModuleHash},
+        module_cache::{FileSystemCache, ModuleCache},
         package_loader::{BuiltinPackageLoader, PackageLoader},
-        resolver::{
-            FileSystemSource, InMemorySource, MultiSource, PackageSpecifier, Source, WapmSource,
-            WebSource,
-        },
+        resolver::{FileSystemSource, InMemorySource, MultiSource, Source, WapmSource, WebSource},
         task_manager::{
             tokio::{RuntimeOrHandle, TokioTaskManager},
             VirtualTaskManagerExt,
@@ -228,7 +227,7 @@ impl Wasi {
 
         let mut uses = Vec::new();
         for name in &self.uses {
-            let specifier = PackageSpecifier::parse(name)
+            let specifier = PackageSpecifier::from_str(name)
                 .with_context(|| format!("Unable to parse \"{name}\" as a package specifier"))?;
             let pkg = {
                 let inner_rt = rt.clone();
@@ -535,6 +534,7 @@ impl Wasi {
         engine: Engine,
         env: &WasmerEnv,
         rt_or_handle: I,
+        preferred_webc_version: webc::Version,
     ) -> Result<impl Runtime + Send + Sync>
     where
         I: Into<RuntimeOrHandle>,
@@ -567,7 +567,7 @@ impl Wasi {
             .prepare_package_loader(env, client.clone())
             .context("Unable to prepare the package loader")?;
 
-        let registry = self.prepare_source(env, client)?;
+        let registry = self.prepare_source(env, client, preferred_webc_version)?;
 
         let cache_dir = env.cache_dir().join("compiled");
         let module_cache = wasmer_wasix::runtime::module_cache::in_memory()
@@ -629,6 +629,7 @@ impl Wasi {
         &self,
         env: &WasmerEnv,
         client: Arc<dyn HttpClient + Send + Sync>,
+        preferred_webc_version: webc::Version,
     ) -> Result<impl Source + Send + Sync> {
         let mut source = MultiSource::new();
 
@@ -645,7 +646,8 @@ impl Wasi {
         let graphql_endpoint = self.graphql_endpoint(env)?;
         let cache_dir = env.cache_dir().join("queries");
         let mut wapm_source = WapmSource::new(graphql_endpoint, Arc::clone(&client))
-            .with_local_cache(cache_dir, WAPM_SOURCE_CACHE_TIMEOUT);
+            .with_local_cache(cache_dir, WAPM_SOURCE_CACHE_TIMEOUT)
+            .with_preferred_webc_version(preferred_webc_version);
         if let Some(token) = env
             .config()?
             .registry

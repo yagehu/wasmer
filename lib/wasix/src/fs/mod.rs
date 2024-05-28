@@ -25,6 +25,7 @@ use serde_derive::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, trace};
 use virtual_fs::{copy_reference, FileSystem, FsError, OpenOptions, VirtualFile};
+use wasmer_config::package::PackageId;
 use wasmer_wasix_types::{
     types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO},
     wasi::{
@@ -307,6 +308,13 @@ impl WasiFsRoot {
 }
 
 impl FileSystem for WasiFsRoot {
+    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
+        match self {
+            WasiFsRoot::Sandbox(fs) => fs.readlink(path),
+            WasiFsRoot::Backing(fs) => fs.readlink(path),
+        }
+    }
+
     fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
         match self {
             WasiFsRoot::Sandbox(fs) => fs.read_dir(path),
@@ -492,7 +500,7 @@ pub struct WasiFs {
     #[cfg_attr(feature = "enable-serde", serde(skip, default))]
     pub root_fs: WasiFsRoot,
     pub root_inode: InodeGuard,
-    pub has_unioned: Arc<Mutex<HashSet<String>>>,
+    pub has_unioned: Arc<Mutex<HashSet<PackageId>>>,
 
     // TODO: remove
     // using an atomic is a hack to enable customization after construction,
@@ -565,9 +573,7 @@ impl WasiFs {
         &self,
         binary: &BinaryPackage,
     ) -> Result<(), virtual_fs::FsError> {
-        let package_name = binary.package_name.clone();
-
-        let needs_to_be_unioned = self.has_unioned.lock().unwrap().insert(package_name);
+        let needs_to_be_unioned = self.has_unioned.lock().unwrap().insert(binary.id.clone());
 
         if !needs_to_be_unioned {
             return Ok(());
@@ -1001,7 +1007,8 @@ impl WasiFs {
                                 }
                             } else if file_type.is_symlink() {
                                 should_insert = false;
-                                let link_value = file.read_link().map_err(map_io_err)?;
+                                let link_value =
+                                    self.root_fs.readlink(&file).ok().ok_or(Errno::Noent)?;
                                 debug!("attempting to decompose path {:?}", link_value);
 
                                 let (pre_open_dir_fd, relative_path) = if link_value.is_relative() {
@@ -2045,6 +2052,9 @@ impl FallbackFileSystem {
 }
 
 impl FileSystem for FallbackFileSystem {
+    fn readlink(&self, _path: &Path) -> virtual_fs::Result<PathBuf> {
+        Self::fail()
+    }
     fn read_dir(&self, _path: &Path) -> Result<virtual_fs::ReadDir, FsError> {
         Self::fail();
     }

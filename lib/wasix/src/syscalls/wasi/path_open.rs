@@ -128,6 +128,15 @@ pub(crate) fn path_open_internal(
     let (memory, mut state, mut inodes) =
         unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
+    if !wasi_try_ok_ok!(state.fs.get_fd_inode(dirfd))
+        .deref()
+        .name
+        .starts_with('/')
+        && path.starts_with('/')
+    {
+        return Ok(Err(Errno::Inval));
+    }
+
     let path_arg = std::path::PathBuf::from(&path);
     let maybe_inode = state.fs.get_inode_at_path(
         inodes,

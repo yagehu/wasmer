@@ -606,14 +606,6 @@ impl WasiFs {
             if path.contains("//") {
                 path = path.replace("//", "/");
             }
-        } else if !path.starts_with('/') {
-            // Path is relative but does not start with `./`
-
-            let current_dir = self.current_dir.lock().unwrap();
-            path = format!("{}/{}", current_dir.as_str(), &path);
-            if path.contains("//") {
-                path = path.replace("//", "/");
-            }
         }
         path
     }

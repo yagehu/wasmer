@@ -27,7 +27,7 @@ fn main() {
             fd,
             0,
             path.as_ptr() as i32,
-            path.as_bytes().len() as i32 + 1,
+            path.as_bytes().len() as i32,
             0,
             0,
             0,

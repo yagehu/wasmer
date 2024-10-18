@@ -1,7 +1,7 @@
 //! Builder system for configuring a [`WasiState`] and creating it.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -10,6 +10,7 @@ use rand::Rng;
 use thiserror::Error;
 use virtual_fs::{ArcFile, FileSystem, FsError, TmpFileSystem, VirtualFile};
 use wasmer::{AsStoreMut, Extern, Imports, Instance, Module, Store};
+use wasmer_config::package::PackageId;
 
 #[cfg(feature = "journal")]
 use crate::journal::{DynJournal, SnapshotTrigger};
@@ -48,6 +49,8 @@ use super::env::WasiEnvInit;
 /// ```
 #[derive(Default)]
 pub struct WasiEnvBuilder {
+    /// Name of entry function. Defaults to running `_start` if not specified.
+    pub(super) entry_function: Option<String>,
     /// Command line arguments.
     pub(super) args: Vec<String>,
     /// Environment variables.
@@ -68,6 +71,8 @@ pub struct WasiEnvBuilder {
 
     /// List of webc dependencies to be injected.
     pub(super) uses: Vec<BinaryPackage>,
+
+    pub(super) included_packages: HashSet<PackageId>,
 
     pub(super) module_hash: Option<ModuleHash>,
 
@@ -94,6 +99,7 @@ impl std::fmt::Debug for WasiEnvBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // TODO: update this when stable
         f.debug_struct("WasiEnvBuilder")
+            .field("entry_function", &self.entry_function)
             .field("args", &self.args)
             .field("envs", &self.envs)
             .field("preopens", &self.preopens)
@@ -237,6 +243,21 @@ impl WasiEnvBuilder {
         &mut self.envs
     }
 
+    pub fn entry_function<S>(mut self, entry_function: S) -> Self
+    where
+        S: AsRef<str>,
+    {
+        self.set_entry_function(entry_function);
+        self
+    }
+
+    pub fn set_entry_function<S>(&mut self, entry_function: S)
+    where
+        S: AsRef<str>,
+    {
+        self.entry_function = Some(entry_function.as_ref().to_owned());
+    }
+
     /// Add an argument.
     ///
     /// Arguments must not contain the nul (0x0) byte
@@ -320,6 +341,21 @@ impl WasiEnvBuilder {
     /// resulting WASI instance.
     pub fn add_webc(&mut self, pkg: BinaryPackage) -> &mut Self {
         self.uses.push(pkg);
+        self
+    }
+
+    /// Adds a package that is already included in the [`WasiEnvBuilder`] filesystem.
+    /// These packages will not be merged to the final filesystem since they are already included.
+    pub fn include_package(&mut self, pkg_id: PackageId) -> &mut Self {
+        self.included_packages.insert(pkg_id);
+        self
+    }
+
+    /// Adds packages that is already included in the [`WasiEnvBuilder`] filesystem.
+    /// These packages will not be merged to the final filesystem since they are already included.
+    pub fn include_packages(&mut self, pkg_ids: impl IntoIterator<Item = PackageId>) -> &mut Self {
+        self.included_packages.extend(pkg_ids);
+
         self
     }
 
@@ -841,11 +877,15 @@ impl WasiEnvBuilder {
             wasi_fs.set_current_dir(s);
         }
 
+        for id in &self.included_packages {
+            wasi_fs.has_unioned.lock().unwrap().insert(id.clone());
+        }
+
         let state = WasiState {
             fs: wasi_fs,
             secret: rand::thread_rng().gen::<[u8; 32]>(),
             inodes,
-            args: self.args.clone(),
+            args: std::sync::Mutex::new(self.args.clone()),
             preopen: self.vfs_preopens.clone(),
             futexs: Default::default(),
             clock_offset: Default::default(),
@@ -1002,6 +1042,8 @@ impl WasiEnvBuilder {
             );
         }
 
+        let entry_function = self.entry_function.clone();
+
         let (instance, env) = self.instantiate_ext(module, module_hash, store)?;
 
         // Bootstrap the process
@@ -1014,7 +1056,9 @@ impl WasiEnvBuilder {
                 .map_err(|exit| WasiRuntimeError::Wasi(WasiError::Exit(exit)))?;
         }
 
-        let start = instance.exports.get_function("_start")?;
+        let start = instance
+            .exports
+            .get_function(entry_function.as_deref().unwrap_or("_start"))?;
         env.data(&store).thread.set_status_running();
 
         let result = crate::run_wasi_func_start(start, store);

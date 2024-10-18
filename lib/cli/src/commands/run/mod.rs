@@ -1,24 +1,25 @@
 #![allow(missing_docs, unused)]
 
+mod capabilities;
 mod wasi;
 
 use std::{
-    collections::BTreeMap,
+    collections::{hash_map::DefaultHasher, BTreeMap},
     fmt::{Binary, Display},
     fs::File,
+    hash::{BuildHasherDefault, Hash, Hasher},
     io::{ErrorKind, LineWriter, Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context, Error};
+use anyhow::{anyhow, bail, Context, Error};
 use clap::{Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar};
 use once_cell::sync::Lazy;
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::Url;
 #[cfg(feature = "sys")]
@@ -75,9 +76,12 @@ pub struct Run {
     /// Set the default stack size (default is 1048576)
     #[clap(long = "stack-size")]
     stack_size: Option<usize>,
-    /// The function or command to invoke.
-    #[clap(short, long, aliases = &["command", "invoke", "command-name"])]
+    /// The entrypoint module for webc packages.
+    #[clap(short, long, aliases = &["command", "command-name"])]
     entrypoint: Option<String>,
+    /// The function to invoke.
+    #[clap(short, long)]
+    invoke: Option<String>,
     /// Generate a coredump at this path if a WebAssembly trap occurs
     #[clap(name = "COREDUMP_PATH", long)]
     coredump_on_trap: Option<PathBuf>,
@@ -98,7 +102,7 @@ impl Run {
     }
 
     #[tracing::instrument(level = "debug", name = "wasmer_run", skip_all)]
-    fn execute_inner(self, output: Output) -> Result<(), Error> {
+    fn execute_inner(mut self, output: Output) -> Result<(), Error> {
         let pb = ProgressBar::new_spinner();
         pb.set_draw_target(output.draw_target());
         pb.enable_steady_tick(TICK);
@@ -115,10 +119,15 @@ impl Run {
             wasmer_vm::set_stack_size(self.stack_size.unwrap());
         }
 
-        // check for the preferred webc version
-        let preferred_webc_version = match std::env::var("WASMER_USE_WEBCV3") {
-            Ok(val) if ["1", "yes", "true"].contains(&val.as_str()) => webc::Version::V3,
-            _ => webc::Version::V2,
+        // Check for the preferred webc version.
+        // Default to v3.
+        let webc_version_var = std::env::var("WASMER_WEBC_VERSION");
+        let preferred_webc_version = match webc_version_var.as_deref() {
+            Ok("2") => webc::Version::V2,
+            Ok("3") | Err(_) => webc::Version::V3,
+            Ok(other) => {
+                bail!("unknown webc version: '{other}'");
+            }
         };
 
         let _guard = handle.enter();
@@ -135,9 +144,13 @@ impl Run {
         #[cfg(not(feature = "sys"))]
         let engine = store.engine().clone();
 
-        let runtime =
-            self.wasi
-                .prepare_runtime(engine, &self.env, runtime, preferred_webc_version)?;
+        let runtime = self.wasi.prepare_runtime(
+            engine,
+            &self.env,
+            &capabilities::get_capability_cache_path(&self.env, &self.input)?,
+            runtime,
+            preferred_webc_version,
+        )?;
 
         // This is a slow operation, so let's temporarily wrap the runtime with
         // something that displays progress
@@ -146,6 +159,12 @@ impl Run {
         let monitoring_runtime: Arc<dyn Runtime + Send + Sync> = monitoring_runtime;
 
         let target = self.input.resolve_target(&monitoring_runtime, &pb)?;
+
+        if let ExecutableTarget::Package(ref pkg) = target {
+            self.wasi
+                .mapped_dirs
+                .extend(pkg.additional_host_mapped_directories.clone());
+        }
 
         pb.finish_and_clear();
 
@@ -203,7 +222,7 @@ impl Run {
     ) -> Result<(), Error> {
         let id = match self.entrypoint.as_deref() {
             Some(cmd) => cmd,
-            None => infer_webc_entrypoint(pkg)?,
+            None => pkg.infer_entrypoint()?,
         };
         let cmd = pkg
             .get_command(id)
@@ -361,19 +380,19 @@ impl Run {
         let instance = Instance::new(store, module, &imports)
             .context("Unable to instantiate the WebAssembly module")?;
 
-        let entrypoint  = match &self.entrypoint {
+        let entry_function  = match &self.invoke {
             Some(entry) => {
                 instance.exports
                     .get_function(entry)
-                    .with_context(|| format!("The module doesn't contain a \"{entry}\" function"))?
+                    .with_context(|| format!("The module doesn't export a function named \"{entry}\""))?
             },
             None => {
                 instance.exports.get_function("_start")
-                    .context("The module doesn't contain a \"_start\" function. Either implement it or specify an entrypoint function.")?
+                    .context("The module doesn't export a \"_start\" function. Either implement it or specify an entry function with --invoke")?
             }
         };
 
-        let return_values = invoke_function(&instance, store, entrypoint, &self.args)?;
+        let return_values = invoke_function(&instance, store, entry_function, &self.args)?;
 
         println!(
             "{}",
@@ -408,6 +427,10 @@ impl Run {
             .with_tmp_mapped(is_tmp_mapped)
             .with_forward_host_env(self.wasi.forward_host_env)
             .with_capabilities(self.wasi.capabilities());
+
+        if let Some(ref entry_function) = self.invoke {
+            runner.with_entry_function(entry_function);
+        }
 
         #[cfg(feature = "journal")]
         {
@@ -484,7 +507,7 @@ impl Run {
     }
 
     fn from_binfmt_args_fallible() -> Result<Self, Error> {
-        if !cfg!(linux) {
+        if cfg!(not(target_os = "linux")) {
             bail!("binfmt_misc is only available on linux.");
         }
 
@@ -503,6 +526,7 @@ impl Run {
             wcgi: WcgiOptions::default(),
             stack_size: None,
             entrypoint: Some(original_executable.to_string()),
+            invoke: None,
             coredump_on_trap: None,
             input: PackageSource::infer(executable)?,
             args: args.to_vec(),
@@ -552,25 +576,6 @@ fn parse_value(s: &str, ty: wasmer_types::Type) -> Result<Value, Error> {
         _ => bail!("There is no known conversion from {s:?} to {ty:?}"),
     };
     Ok(value)
-}
-
-fn infer_webc_entrypoint(pkg: &BinaryPackage) -> Result<&str, Error> {
-    if let Some(entrypoint) = pkg.entrypoint_cmd.as_deref() {
-        return Ok(entrypoint);
-    }
-
-    match pkg.commands.as_slice() {
-        [] => bail!("The WEBC file doesn't contain any executable commands"),
-        [one] => Ok(one.name()),
-        [..] => {
-            let mut commands: Vec<_> = pkg.commands.iter().map(|cmd| cmd.name()).collect();
-            commands.sort();
-            bail!(
-                "Unable to determine the WEBC file's entrypoint. Please choose one of {:?}",
-                commands,
-            );
-        }
-    }
 }
 
 /// The input that was passed in via the command-line.
@@ -995,7 +1000,10 @@ impl wasmer_wasix::runtime::package_loader::PackageLoader for MonitoringPackageL
         &self,
         root: &Container,
         resolution: &wasmer_wasix::runtime::resolver::Resolution,
+        root_is_local_dir: bool,
     ) -> Result<BinaryPackage, Error> {
-        self.inner.load_package_tree(root, resolution).await
+        self.inner
+            .load_package_tree(root, resolution, root_is_local_dir)
+            .await
     }
 }

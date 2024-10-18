@@ -11,8 +11,7 @@ use crate::Features;
 use crate::{ModuleEnvironment, ModuleMiddlewareChain};
 use core::mem::MaybeUninit;
 use enumset::EnumSet;
-use rkyv::de::deserializers::SharedDeserializeMap;
-use rkyv::option::ArchivedOption;
+use rkyv::{option::ArchivedOption, rancor::Error as RkyvError};
 use self_cell::self_cell;
 use shared_buffer::OwnedBuffer;
 use std::sync::Arc;
@@ -22,11 +21,16 @@ use wasmer_types::ArchivedSerializableCompilation;
 use wasmer_types::ArchivedSerializableModule;
 use wasmer_types::CompileModuleInfo;
 use wasmer_types::DeserializeError;
+
+// Not every compiler backend uses these.
+#[allow(unused)]
 use wasmer_types::{
     CompileError, CpuFeature, CustomSection, Dwarf, FunctionIndex, LocalFunctionIndex, MemoryIndex,
     MemoryStyle, ModuleHash, ModuleInfo, OwnedDataInitializer, Relocation, SectionIndex,
     SignatureIndex, TableIndex, TableStyle, Target,
 };
+
+#[allow(unused)]
 use wasmer_types::{
     CompiledFunctionFrameInfo, FunctionBody, HashAlgorithm, SerializableCompilation,
     SerializableModule,
@@ -34,6 +38,7 @@ use wasmer_types::{
 use wasmer_types::{MetadataHeader, SerializeError};
 
 /// A compiled wasm module, ready to be instantiated.
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct ArtifactBuild {
     serializable: SerializableModule,
 }
@@ -67,7 +72,9 @@ impl ArtifactBuild {
         // We try to apply the middleware first
         let mut module = translation.module;
         let middlewares = compiler.get_middlewares();
-        middlewares.apply_on_module_info(&mut module);
+        middlewares
+            .apply_on_module_info(&mut module)
+            .map_err(|err| CompileError::MiddlewareError(err.to_string()))?;
 
         if let Some(hash_algorithm) = hash_algorithm {
             let hash = match hash_algorithm {
@@ -268,7 +275,7 @@ impl<'a> ModuleFromArchive<'a> {
         Ok(Self {
             compilation: &module.compilation,
             data_initializers: &module.data_initializers,
-            cpu_features: module.cpu_features,
+            cpu_features: module.cpu_features.to_native(),
             original_module: module,
         })
     }
@@ -285,8 +292,16 @@ self_cell!(
     impl {Debug}
 );
 
+#[cfg(feature = "artifact-size")]
+impl loupe::MemoryUsage for ArtifactBuildFromArchiveCell {
+    fn size_of_val(&self, _tracker: &mut dyn loupe::MemoryUsageTracker) -> usize {
+        std::mem::size_of_val(self.borrow_owner()) + std::mem::size_of_val(self.borrow_dependent())
+    }
+}
+
 /// A compiled wasm module that was loaded from a serialized archive.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct ArtifactBuildFromArchive {
     cell: Arc<ArtifactBuildFromArchiveCell>,
 
@@ -295,6 +310,7 @@ pub struct ArtifactBuildFromArchive {
 }
 
 impl ArtifactBuildFromArchive {
+    #[allow(unused)]
     pub(crate) fn try_new(
         buffer: OwnedBuffer,
         module_builder: impl FnOnce(
@@ -305,9 +321,8 @@ impl ArtifactBuildFromArchive {
 
         let cell = ArtifactBuildFromArchiveCell::try_new(buffer, |buffer| {
             let module = module_builder(buffer)?;
-            let mut deserializer = SharedDeserializeMap::new();
             compile_info = MaybeUninit::new(
-                rkyv::Deserialize::deserialize(&module.compile_info, &mut deserializer)
+                rkyv::deserialize::<_, RkyvError>(&module.compile_info)
                     .map_err(|e| DeserializeError::CorruptedBinary(format!("{:?}", e)))?,
             );
             ModuleFromArchive::from_serializable_module(module)
@@ -382,7 +397,10 @@ impl ArtifactBuildFromArchive {
 
     /// Get LibCall Trampoline Section Index
     pub fn get_libcall_trampolines(&self) -> SectionIndex {
-        self.cell.borrow_dependent().compilation.libcall_trampolines
+        rkyv::deserialize::<_, RkyvError>(
+            &self.cell.borrow_dependent().compilation.libcall_trampolines,
+        )
+        .unwrap()
     }
 
     /// Get LibCall Trampoline Length
@@ -390,13 +408,16 @@ impl ArtifactBuildFromArchive {
         self.cell
             .borrow_dependent()
             .compilation
-            .libcall_trampoline_len as usize
+            .libcall_trampoline_len
+            .to_native() as usize
     }
 
     /// Get Debug optional Dwarf ref
-    pub fn get_debug_ref(&self) -> Option<&Dwarf> {
+    pub fn get_debug_ref(&self) -> Option<Dwarf> {
         match self.cell.borrow_dependent().compilation.debug {
-            ArchivedOption::Some(ref x) => Some(x),
+            ArchivedOption::Some(ref x) => {
+                Some(rkyv::deserialize::<_, rkyv::rancor::Error>(x).unwrap())
+            }
             ArchivedOption::None => None,
         }
     }
@@ -412,10 +433,8 @@ impl ArtifactBuildFromArchive {
     pub fn deserialize_frame_info_ref(
         &self,
     ) -> Result<PrimaryMap<LocalFunctionIndex, CompiledFunctionFrameInfo>, DeserializeError> {
-        let mut deserializer = SharedDeserializeMap::new();
-        rkyv::Deserialize::deserialize(
+        rkyv::deserialize::<_, RkyvError>(
             &self.cell.borrow_dependent().compilation.function_frame_info,
-            &mut deserializer,
         )
         .map_err(|e| DeserializeError::CorruptedBinary(format!("{:?}", e)))
     }
@@ -468,12 +487,9 @@ impl<'a> ArtifactCreate<'a> for ArtifactBuildFromArchive {
         // deserialized from a file makes little sense, so hopefully, this is not a
         // common use-case.
 
-        let mut deserializer = SharedDeserializeMap::new();
-        let mut module: SerializableModule = rkyv::Deserialize::deserialize(
-            self.cell.borrow_dependent().original_module,
-            &mut deserializer,
-        )
-        .map_err(|e| SerializeError::Generic(e.to_string()))?;
+        let mut module: SerializableModule =
+            rkyv::deserialize::<_, RkyvError>(self.cell.borrow_dependent().original_module)
+                .map_err(|e| SerializeError::Generic(e.to_string()))?;
         module.compile_info = self.compile_info.clone();
         serialize_module(&module)
     }

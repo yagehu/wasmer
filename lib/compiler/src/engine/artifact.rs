@@ -44,6 +44,7 @@ use wasmer_types::{SerializableModule, SerializeError};
 use wasmer_vm::{FunctionBodyPtr, MemoryStyle, TableStyle, VMSharedSignatureIndex, VMTrampoline};
 use wasmer_vm::{InstanceAllocator, StoreObjects, TrapHandlerFn, VMConfig, VMExtern, VMInstance};
 
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct AllocatedArtifact {
     // This shows if the frame info has been regestered already or not.
     // Because the 'GlobalFrameInfoRegistration' ownership can be transfered to EngineInner
@@ -55,6 +56,8 @@ pub struct AllocatedArtifact {
     // so the GloabelFrameInfo and MMap stays in sync and get dropped at the same time
     frame_info_registration: Option<GlobalFrameInfoRegistration>,
     finished_functions: BoxedSlice<LocalFunctionIndex, FunctionBodyPtr>,
+
+    #[cfg_attr(feature = "artifact-size", loupe(skip))]
     finished_function_call_trampolines: BoxedSlice<SignatureIndex, VMTrampoline>,
     finished_dynamic_function_trampolines: BoxedSlice<FunctionIndex, FunctionBodyPtr>,
     signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
@@ -62,6 +65,7 @@ pub struct AllocatedArtifact {
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[repr(transparent)]
 /// A unique identifier for an Artifact.
 pub struct ArtifactId {
@@ -91,6 +95,7 @@ impl Default for ArtifactId {
 }
 
 /// A compiled wasm module, ready to be instantiated.
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub struct Artifact {
     id: ArtifactId,
     artifact: ArtifactBuildVariant,
@@ -102,6 +107,7 @@ pub struct Artifact {
 /// Artifacts may be created as the result of the compilation of a wasm
 /// module, corresponding to `ArtifactBuildVariant::Plain`, or loaded
 /// from an archive, corresponding to `ArtifactBuildVariant::Archived`.
+#[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 pub enum ArtifactBuildVariant {
     Plain(ArtifactBuild),
     Archived(ArtifactBuildFromArchive),
@@ -359,7 +365,8 @@ impl Artifact {
         };
 
         let debug_ref = match &artifact {
-            ArtifactBuildVariant::Plain(p) => p.get_debug_ref(),
+            // Why clone? See comment at the top of ./lib/types/src/indexes.rs.
+            ArtifactBuildVariant::Plain(p) => p.get_debug_ref().cloned(),
             ArtifactBuildVariant::Archived(a) => a.get_debug_ref(),
         };
         let eh_frame = match debug_ref {
@@ -634,17 +641,6 @@ impl<'a> DataInitializerLocationLike for DataInitializerLocationVariant<'a> {
 }
 
 impl Artifact {
-    /// Register thie `Artifact` stack frame information into the global scope.
-    ///
-    /// This is not required anymore as it's done automaticaly when creating by 'Artifact::from_parts'
-    #[deprecated(
-        since = "4.0.0",
-        note = "done automaticaly by Artifact::from_parts, use 'take_frame_info_registration' if you use this method"
-    )]
-    pub fn register_frame_info(&mut self) -> Result<(), DeserializeError> {
-        self.internal_register_frame_info()
-    }
-
     fn internal_register_frame_info(&mut self) -> Result<(), DeserializeError> {
         if self
             .allocated
@@ -697,13 +693,6 @@ impl Artifact {
             .frame_info_registered = true;
 
         Ok(())
-    }
-
-    /// The GlobalFrameInfoRegistration needs to be transfered to EngineInner if
-    /// register_frame_info has been used.
-    #[deprecated(since = "4.0.0", note = "done automaticaly by Artifact::from_parts.")]
-    pub fn take_frame_info_registration(&mut self) -> Option<GlobalFrameInfoRegistration> {
-        self.internal_take_frame_info_registration()
     }
 
     fn internal_take_frame_info_registration(&mut self) -> Option<GlobalFrameInfoRegistration> {
@@ -890,7 +879,9 @@ impl Artifact {
         use crate::translator::ModuleMiddlewareChain;
         let mut module = translation.module;
         let middlewares = compiler.get_middlewares();
-        middlewares.apply_on_module_info(&mut module);
+        middlewares
+            .apply_on_module_info(&mut module)
+            .map_err(|e| CompileError::MiddlewareError(e.to_string()))?;
 
         let memory_styles: PrimaryMap<MemoryIndex, MemoryStyle> = module
             .memories

@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::time::Duration;
 
 use anyhow::Context;
 use futures::{future::BoxFuture, TryStreamExt};
@@ -44,9 +44,10 @@ impl ReqwestHttpClient {
         // TODO: use persistent client?
         let builder = {
             let _guard = Handle::try_current().map_err(|_| self.handle.enter());
-            let mut builder = reqwest::ClientBuilder::new().connect_timeout(self.connect_timeout);
-            if let Some(proxy) = get_proxy()? {
-                builder = builder.proxy(proxy);
+            let mut builder = reqwest::ClientBuilder::new();
+            #[cfg(not(feature = "js"))]
+            {
+                builder = builder.connect_timeout(self.connect_timeout);
             }
             builder
         };
@@ -69,16 +70,66 @@ impl ReqwestHttpClient {
         let headers = std::mem::take(response.headers_mut());
 
         let status = response.status();
+
+        // Download the body.
+        #[cfg(not(feature = "js"))]
         let data = if let Some(timeout) = self.response_body_chunk_timeout {
+            // Download the body with a chunk timeout.
+            // The timeout prevents long stalls.
+
             let mut stream = response.bytes_stream();
             let mut buf = Vec::new();
-            while let Some(chunk) = tokio::time::timeout(timeout, stream.try_next()).await?? {
-                buf.extend_from_slice(&chunk);
+
+            // Creating tokio timeouts has overhead, so instead of a fresh
+            // timeout per chunk a shared timeout is used, and a chunk counter
+            // is kept. Only if no chunk was downloaded within the timeout a
+            // timeout error is raised.
+            'OUTER: loop {
+                let timeout = tokio::time::sleep(timeout);
+                pin_utils::pin_mut!(timeout);
+
+                let mut chunk_count = 0;
+
+                loop {
+                    tokio::select! {
+                        // Biased because the timeout is secondary,
+                        // and chunks should always have priority.
+                        biased;
+
+                        res = stream.try_next() => {
+                            match res {
+                                Ok(Some(chunk)) => {
+                                    buf.extend_from_slice(&chunk);
+                                    chunk_count += 1;
+                                }
+                                Ok(None) => {
+                                    break 'OUTER;
+                                }
+                                Err(e) => {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+
+                        _ = &mut timeout => {
+                            if chunk_count == 0 {
+                                return Err(anyhow::anyhow!("Timeout while downloading response body"));
+                            } else {
+                                // Timeout, but chunks were still downloaded, so
+                                // just continue with a fresh timeout.
+                                continue 'OUTER;
+                            }
+                        }
+                    }
+                }
             }
+
             buf
         } else {
             response.bytes().await?.to_vec()
         };
+        #[cfg(feature = "js")]
+        let data = response.bytes().await?.to_vec();
 
         Ok(HttpResponse {
             status,
@@ -90,19 +141,26 @@ impl ReqwestHttpClient {
 }
 
 impl super::HttpClient for ReqwestHttpClient {
+    #[cfg(not(feature = "js"))]
     fn request(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, anyhow::Error>> {
         let client = self.clone();
         let f = async move { client.request(request).await };
         Box::pin(f)
     }
-}
 
-pub fn get_proxy() -> Result<Option<reqwest::Proxy>, anyhow::Error> {
-    if let Ok(scheme) = env::var("http_proxy").or_else(|_| env::var("HTTP_PROXY")) {
-        let proxy = reqwest::Proxy::all(scheme)?;
-
-        Ok(Some(proxy))
-    } else {
-        Ok(None)
+    #[cfg(feature = "js")]
+    fn request(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, anyhow::Error>> {
+        let client = self.clone();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = client.request(request).await;
+            let _ = sender.send(result);
+        });
+        Box::pin(async move {
+            match receiver.await {
+                Ok(result) => result,
+                Err(e) => Err(anyhow::Error::new(e)),
+            }
+        })
     }
 }
